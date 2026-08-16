@@ -19,6 +19,10 @@ Kwon et al., *Efficient Memory Management for Large Language Model Serving with 
 
 `PrefixCache` maps an exact token-prefix to a retained block-table snapshot. A later sequence with the same prefix **reuses the same physical block IDs** until it writes (COW).
 
+## Papers on disk
+
+- [`papers/kwon-vllm-pagedattention-2023.pdf`](papers/kwon-vllm-pagedattention-2023.pdf) — Kwon et al. Efficient Memory Management for LLM Serving (2023) ([arXiv:2309.06180](https://arxiv.org/abs/2309.06180))
+
 ## Run
 
 ```bash
