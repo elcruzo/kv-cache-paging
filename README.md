@@ -29,6 +29,6 @@ Two named paths (same math, no silent switch):
 ## Run
 
 ```bash
-python demo.py
+python main.py
 python -m pytest test_paged_kv.py -q
 ```
