@@ -80,7 +80,7 @@ def test_cow_share_then_diverge_refcount():
     assert k1.shape[0] == 5
 
 
-def test_paged_attention_matches_contiguous_and_blockwise():
+def test_paged_attention_matches_contiguous_and_blockwise(monkeypatch):
     rng = np.random.default_rng(2)
     h, d, bs = 3, 8, 3
     alloc = BlockAllocator(20, bs, h, d)
@@ -98,12 +98,19 @@ def test_paged_attention_matches_contiguous_and_blockwise():
     q = rng.standard_normal((h, d)).astype(np.float32)
     k_c = np.stack(ks, axis=0)
     v_c = np.stack(vs, axis=0)
-    out_p = paged_attention(q, s)
-    out_b = paged_attention_blockwise(q, s)
     out_c = contiguous_attention(q, k_c, v_c)
+
+    # Gather path (paged_attention) still works without poison.
+    out_p = paged_attention(q, s)
     assert np.allclose(out_p, out_c, atol=1e-5)
+
+    # Blockwise must walk physical blocks — not gather_kv then contiguous attention.
+    def _gather_must_not_run(self):
+        raise AssertionError("paged_attention_blockwise must not call Sequence.gather_kv")
+
+    monkeypatch.setattr(Sequence, "gather_kv", _gather_must_not_run)
+    out_b = paged_attention_blockwise(q, s)
     assert np.allclose(out_b, out_c, atol=1e-5)
-    # Not an identity stub: blockwise must use online stats (poisoning gather path unused).
     assert out_b.shape == (h, d)
 
 
