@@ -1,19 +1,38 @@
-"""vLLM-style paged KV: block table + attention over non-contiguous physical blocks.
+"""vLLM-style block-table KV memory model + COW + hash-chained prefix cache.
 
-Kwon et al. 2023. vLLM later deleted the named PagedAttention CUDA kernel
-(PR #47361, 2026) but kept this block-table memory model. This file is the
-memory model plus gather-then-attend — not a CUDA kernel.
+Kwon et al. 2023. In July 2026 vLLM deleted the named PagedAttention *CUDA kernel*
+(PR #47361) but kept this memory model: fixed-size physical blocks, per-sequence
+block tables, and gather/attend over non-contiguous K/V. This file implements that
+model — not a CUDA kernel and not a vLLM/FAISS wrapper.
+
+Prefix reuse follows Automatic Prefix Caching: only *full* blocks are indexed, each
+keyed by sha256(parent_hash || block_tokens).
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
+from collections import OrderedDict
 
 import numpy as np
 
 
 class KVCacheOOM(MemoryError):
-    """Raised when the block pool is exhausted."""
+    """Raised when the block pool has no free physical blocks."""
+
+
+def block_hash(parent: bytes | None, tokens: tuple[int, ...]) -> bytes:
+    """Content-addressed block key: sha256(parent || token ids). Parent is None for block 0."""
+    h = hashlib.sha256()
+    if parent is not None:
+        h.update(parent)
+    else:
+        h.update(b"\x00ROOT\x00")
+    h.update(b"\x00")
+    for t in tokens:
+        h.update(int(t).to_bytes(8, "little", signed=True))
+    return h.digest()
 
 
 class BlockAllocator:
@@ -52,14 +71,14 @@ class BlockAllocator:
             self.free.append(block)
 
     def cow(self, block: int) -> int:
-        """Copy-on-write: if shared, clone into a new physical block."""
+        """Named paths: exclusive_write (refcount==1) vs clone_shared (refcount>1)."""
         if self.refcount[block] == 1:
-            return block
+            return block  # exclusive_write
         self.refcount[block] -= 1
         nb = self.allocate()
         self.k[nb] = self.k[block].copy()
         self.v[nb] = self.v[block].copy()
-        return nb
+        return nb  # clone_shared
 
     @property
     def free_count(self) -> int:
@@ -79,8 +98,8 @@ class Sequence:
         self.seq_len = 0
         self.tokens: list[int] = []
 
-    def append_kv(self, k_t: np.ndarray, v_t: np.ndarray, token: int | None = None) -> None:
-        """Append one token's K/V. Allocates a block on demand; COW if the slot is shared."""
+    def append_kv(self, k_t: np.ndarray, v_t: np.ndarray, token: int) -> None:
+        """Append one token's K/V. Allocates on demand; COW if the open block is shared."""
         k_t = np.asarray(k_t)
         v_t = np.asarray(v_t)
         bs = self.alloc.block_size
@@ -95,11 +114,10 @@ class Sequence:
         self.alloc.k[phys, off] = k_t
         self.alloc.v[phys, off] = v_t
         self.seq_len += 1
-        if token is not None:
-            self.tokens.append(int(token))
+        self.tokens.append(int(token))
 
     def fork(self) -> "Sequence":
-        """Share physical blocks (beam / prefix). Refcounts increment; writes COW."""
+        """Share physical blocks (beam / branching). Refcounts increment; later writes COW."""
         child = Sequence(self.alloc)
         child.block_table = list(self.block_table)
         child.seq_len = self.seq_len
@@ -116,7 +134,7 @@ class Sequence:
         self.tokens.clear()
 
     def gather_kv(self) -> tuple[np.ndarray, np.ndarray]:
-        """Materialize K,V in logical order via the block table (blocks need not be contiguous)."""
+        """Materialize K,V in logical order via the block table (physical ids need not be contiguous)."""
         bs = self.alloc.block_size
         k = np.empty((self.seq_len, self.alloc.n_heads, self.alloc.head_dim), dtype=self.alloc.k.dtype)
         v = np.empty_like(k)
@@ -128,19 +146,12 @@ class Sequence:
         return k, v
 
 
-def paged_attention(q: np.ndarray, seq: Sequence) -> np.ndarray:
-    """Attention of Q against paged K,V. Q is (n_heads, head_dim) — the new query."""
-    k, v = seq.gather_kv()
-    return contiguous_attention(q, k, v)
-
-
 def contiguous_attention(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """q: (H, D); k,v: (T, H, D). Per-head softmax attention."""
+    """q: (H, D); k,v: (T, H, D). Per-head scaled-dot-product attention."""
     q = np.asarray(q, dtype=np.float64)
     k = np.asarray(k, dtype=np.float64)
     v = np.asarray(v, dtype=np.float64)
     scale = 1.0 / math.sqrt(q.shape[-1])
-    # scores (H, T)
     scores = np.einsum("hd,thd->ht", q, k) * scale
     scores = scores - np.max(scores, axis=-1, keepdims=True)
     p = np.exp(scores)
@@ -148,53 +159,118 @@ def contiguous_attention(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndar
     return np.einsum("ht,thd->hd", p, v)
 
 
-class PrefixCache:
-    """Exact-prefix cache: token tuple → retained block table snapshot.
+def paged_attention(q: np.ndarray, seq: Sequence) -> np.ndarray:
+    """Named path gather_then_attend: materialize logical K/V, then contiguous attention."""
+    k, v = seq.gather_kv()
+    return contiguous_attention(q, k, v)
 
-    A hit reuses the same physical block IDs for the shared prefix. The last
-    block is shared with COW so a later write diverges without mutating siblings.
+
+def paged_attention_blockwise(q: np.ndarray, seq: Sequence) -> np.ndarray:
+    """Named path blockwise_online: walk the block table with online softmax — no full gather.
+
+    Same math as gather_then_attend; proves attention over non-contiguous physical blocks.
+    """
+    if seq.seq_len == 0:
+        raise ValueError("empty sequence")
+    q64 = np.asarray(q, dtype=np.float64)
+    scale = 1.0 / math.sqrt(q64.shape[-1])
+    h, d = q64.shape
+    m = np.full(h, -np.inf, dtype=np.float64)
+    l = np.zeros(h, dtype=np.float64)
+    out = np.zeros((h, d), dtype=np.float64)
+    bs = seq.alloc.block_size
+    for i in range(seq.seq_len):
+        phys = seq.block_table[i // bs]
+        off = i % bs
+        k_i = seq.alloc.k[phys, off].astype(np.float64)
+        v_i = seq.alloc.v[phys, off].astype(np.float64)
+        score = np.einsum("hd,hd->h", q64, k_i) * scale
+        m_new = np.maximum(m, score)
+        alpha = np.exp(m - m_new)
+        beta = np.exp(score - m_new)
+        out = out * alpha[:, None] + beta[:, None] * v_i
+        l = l * alpha + beta
+        m = m_new
+    return out / l[:, None]
+
+
+class PrefixCache:
+    """Hash-chained automatic prefix cache (vLLM APC): full blocks only.
+
+    Each full physical block is indexed by sha256(parent_hash || block_tokens).
+    Lookup walks the chain until the first miss. Partial trailing blocks are never cached.
     """
 
     def __init__(self) -> None:
-        self._store: dict[tuple[int, ...], tuple[list[int], int]] = {}
+        # OrderedDict: oldest insertion/touch at front for LRU eviction.
+        self._by_hash: OrderedDict[bytes, int] = OrderedDict()
 
-    def insert(self, seq: Sequence) -> None:
-        if not seq.tokens:
-            return
-        key = tuple(seq.tokens)
-        # Retain so the cache owns a ref even after the inserting seq is freed.
-        for b in seq.block_table:
-            seq.alloc.retain(b)
-        prev = self._store.get(key)
-        if prev is not None:
-            for b in prev[0]:
-                seq.alloc.release(b)
-        self._store[key] = (list(seq.block_table), seq.seq_len)
+    def __len__(self) -> int:
+        return len(self._by_hash)
+
+    def insert(self, seq: Sequence) -> int:
+        """Cache every *full* block of seq. Returns how many new hashes were inserted.
+
+        Named paths per full block:
+          - hash_miss_insert: retain physical block and map hash → id
+          - hash_hit_keep: hash already mapped; leave existing physical id (no remap)
+        """
+        if seq.seq_len != len(seq.tokens):
+            raise ValueError("seq.tokens must cover seq_len for prefix hashing")
+        bs = seq.alloc.block_size
+        n_full = seq.seq_len // bs
+        parent: bytes | None = None
+        n_new = 0
+        for i in range(n_full):
+            chunk = tuple(seq.tokens[i * bs : (i + 1) * bs])
+            h = block_hash(parent, chunk)
+            phys = seq.block_table[i]
+            if h not in self._by_hash:
+                seq.alloc.retain(phys)
+                self._by_hash[h] = phys
+                n_new += 1
+            else:
+                self._by_hash.move_to_end(h)
+            parent = h
+        return n_new
 
     def lookup(self, tokens: list[int], alloc: BlockAllocator) -> tuple[Sequence, int]:
-        """Longest common prefix against any stored sequence. Reuses those physical blocks."""
-        best_n = 0
-        best_table: list[int] | None = None
-        for key, (table, _slen) in self._store.items():
-            n = 0
-            while n < len(key) and n < len(tokens) and key[n] == tokens[n]:
-                n += 1
-            if n > best_n:
-                best_n = n
-                best_table = table
+        """Longest full-block prefix hit. Hit length is always a multiple of block_size.
+
+        Named paths:
+          - cache_hit: retain mapped physical block, append to block table
+          - cache_miss: stop walking; return what was hit (possibly empty)
+        """
         seq = Sequence(alloc)
-        if best_n == 0 or best_table is None:
-            return seq, 0
-        n_blocks = (best_n + alloc.block_size - 1) // alloc.block_size
-        seq.block_table = list(best_table[:n_blocks])
-        seq.seq_len = best_n
-        seq.tokens = list(tokens[:best_n])
-        for b in seq.block_table:
-            alloc.retain(b)
-        return seq, best_n
+        bs = alloc.block_size
+        parent: bytes | None = None
+        hit_tokens = 0
+        n_full = len(tokens) // bs
+        for i in range(n_full):
+            chunk = tuple(tokens[i * bs : (i + 1) * bs])
+            h = block_hash(parent, chunk)
+            phys = self._by_hash.get(h)
+            if phys is None:
+                break  # cache_miss from this block onward
+            self._by_hash.move_to_end(h)
+            alloc.retain(phys)
+            seq.block_table.append(phys)
+            hit_tokens += bs
+            parent = h
+        seq.seq_len = hit_tokens
+        seq.tokens = list(tokens[:hit_tokens])
+        return seq, hit_tokens
+
+    def evict_lru(self, alloc: BlockAllocator, n: int = 1) -> int:
+        """Drop up to n oldest hash entries and release the cache's retain on each."""
+        dropped = 0
+        while dropped < n and self._by_hash:
+            _h, phys = self._by_hash.popitem(last=False)
+            alloc.release(phys)
+            dropped += 1
+        return dropped
 
     def clear(self, alloc: BlockAllocator) -> None:
-        for table, _ in self._store.values():
-            for b in table:
-                alloc.release(b)
-        self._store.clear()
+        for phys in self._by_hash.values():
+            alloc.release(phys)
+        self._by_hash.clear()
