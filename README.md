@@ -26,6 +26,32 @@ Two named paths (same math, no silent switch):
 
 - [`papers/kwon-vllm-pagedattention-2023.pdf`](papers/kwon-vllm-pagedattention-2023.pdf) — Kwon et al. Efficient Memory Management for LLM Serving (2023) ([arXiv:2309.06180](https://arxiv.org/abs/2309.06180))
 
+## Compared to vLLM paged KV
+
+**What you learn here:**
+- Fixed-size physical blocks + per-sequence block tables (no external fragmentation)
+- Copy-on-write fork with refcounts so shared prefixes stay shared until a write
+- Hash-chained automatic prefix cache hits only on full blocks
+
+| | This repo | vLLM (Kwon et al. SOSP 2023) |
+|---|---|---|
+| Scope | NumPy block table + gather/blockwise attn | GPU serving + custom kernels |
+| Sharing | `fork()` + COW clone | Block-table sharing across requests |
+| APC | SHA256 full-block chain | Production prefix caching |
+
+### Numbers (2026-08-16, Darwin 25.5.0 arm64 / Apple M5)
+
+| Metric | This repo | Baseline | Source |
+|---|---|---|---|
+| Gather ≡ contiguous attn | True | — | `python main.py` |
+| Blockwise ≡ contiguous | True | — | same |
+| Prefix full-block hit len | 4 tokens | waste &lt;4% KV (prod) | Kwon/vLLM blog; `main.py` |
+| Pool restored after free | True | — | `main.py` |
+
+```bash
+python main.py
+```
+
 ## Run
 
 ```bash
